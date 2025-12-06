@@ -1,0 +1,22 @@
+[programs.localnet]
+hybrid_token = "7Li88SBz1qTAeroVstZwYyKABskfLWMAAwG4xdDhTbWd"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "devnet"
+wallet = "/home/onyix/Documents/hybrid-token/admin-wallet.json"
+
+
+[programs.devnet]
+hybrid_token = "8mKiRaRw4TaMhdMeCjqMtXFxgc4Kv863nLECCcZrYb9F"
+
+[test]
+deploy = false
+
+[scripts]
+test-manual = "ts-node scripts/test-manual.ts"
+
+
+3cGxqm1zBZBUnbPxoNKwe6d1s5TgJrtuH2fBqM6Mwfv2

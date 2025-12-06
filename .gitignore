@@ -1,0 +1,25 @@
+# ---------------------------------
+# 1. SECURITY (CRITICAL)
+# ---------------------------------
+**/*-keypair.json
+admin-wallet.json
+wallet.json
+id.json
+secret.txt
+.env
+
+# ---------------------------------
+# 2. Build Artifacts (Too huge for GitHub)
+# ---------------------------------
+target/
+node_modules/
+.anchor/
+test-ledger/
+.yarn/
+
+# ---------------------------------
+# 3. System Junk
+# ---------------------------------
+.DS_Store
+**/*.so
+**/*.log

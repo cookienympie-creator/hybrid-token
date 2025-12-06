@@ -1,0 +1,21 @@
+[tool.anchor]
+seeds = false
+
+[features]
+seeds = false
+skip-lint = false
+
+# 🟢 Mainnet Program ID
+[programs.mainnet]
+hybrid_token = "8mKiRaRw4TaMhdMeCjqMtXFxgc4Kv863nLECCcZrYb9F"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+# 🟢 Set cluster to Mainnet
+cluster = "mainnet"
+wallet = "/home/onyix/Documents/hybrid-token/admin-wallet.json"
+
+[scripts]
+test-manual = "ts-node scripts/test-manual.ts"
