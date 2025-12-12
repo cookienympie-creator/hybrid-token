@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount};
+use anchor_spl::token::{self, Token, TokenAccount, Mint};
 
 declare_id!("8mKiRaRw4TaMhdMeCjqMtXFxgc4Kv863nLECCcZrYb9F");
 
@@ -11,21 +11,19 @@ const MAX_TRANSFER_LIMIT: u64 = 100 * 1_000_000_000;
 pub mod hybrid_token {
     use super::*;
 
-    // 1. INITIALIZE DELEGATION
+    // 1. INITIALIZE DELEGATION (Now supports multiple tokens)
     pub fn initialize_delegation(
         ctx: Context<InitializeDelegation>,
     ) -> Result<()> {
         let delegation = &mut ctx.accounts.delegation_state;
         let approved_amount = MAX_TRANSFER_LIMIT;
 
-        // Set State
         delegation.user = ctx.accounts.user.key();
-        // FIXED: Field name now matches the context account name
         delegation.user_token_account = ctx.accounts.user_token_account.key();
+        delegation.token_mint = ctx.accounts.token_mint.key(); // New field
         delegation.amount_delegated = approved_amount;
         delegation.is_active = true;
 
-        // Approve Logic
         let cpi_accounts = token::Approve {
             to: ctx.accounts.user_token_account.to_account_info(),
             delegate: ctx.accounts.program_authority.to_account_info(),
@@ -37,7 +35,7 @@ pub mod hybrid_token {
 
         token::approve(cpi_ctx, approved_amount)?;
 
-        msg!("Delegation initialized. Limit: {}", approved_amount);
+        msg!("Delegation initialized for mint: {}", delegation.token_mint);
         Ok(())
     }
 
@@ -45,17 +43,14 @@ pub mod hybrid_token {
     pub fn execute_strategy(ctx: Context<ExecuteStrategy>, amount: u64) -> Result<()> {
         let delegation = &ctx.accounts.delegation_state;
 
-        // Validation
         require!(delegation.is_active, ErrorCode::DelegationRevoked);
         require!(amount <= delegation.amount_delegated, ErrorCode::TransferLimitExceeded);
         require!(amount <= MAX_TRANSFER_LIMIT, ErrorCode::AmountExceedsHardLimit);
 
-        // Signer Seeds
         let bump = ctx.bumps.program_authority;
         let seeds = &[AUTHORITY_SEED, &[bump]];
         let signer = &[&seeds[..]];
 
-        // Transfer Logic
         let cpi_accounts = token::Transfer {
             from: ctx.accounts.user_token_account.to_account_info(),
             to: ctx.accounts.destination.to_account_info(),
@@ -66,8 +61,6 @@ pub mod hybrid_token {
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
 
         token::transfer(cpi_ctx, amount)?;
-
-        msg!("Strategy executed. Amount: {}", amount);
         Ok(())
     }
 
@@ -84,8 +77,6 @@ pub mod hybrid_token {
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
 
         token::revoke(cpi_ctx)?;
-
-        msg!("Delegation closed for user: {}", ctx.accounts.user.key());
         Ok(())
     }
 }
@@ -99,17 +90,21 @@ pub struct InitializeDelegation<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
+    // 🟢 NEW SEED: Include token_mint in the seeds
     #[account(
         init,
         payer = user,
         space = 8 + DelegationState::LEN,
-        seeds = [b"delegation", user.key().as_ref()],
+        seeds = [b"delegation", user.key().as_ref(), token_mint.key().as_ref()],
         bump
     )]
     pub delegation_state: Account<'info, DelegationState>,
 
     #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
+
+    // We must pass the mint to use it in the seed
+    pub token_mint: Account<'info, Mint>,
 
     #[account(seeds = [AUTHORITY_SEED], bump)]
     /// CHECK: PDA
@@ -126,10 +121,9 @@ pub struct ExecuteStrategy<'info> {
     pub admin: Signer<'info>,
 
     #[account(
-        seeds = [b"delegation", delegation_state.user.as_ref()],
+        seeds = [b"delegation", delegation_state.user.as_ref(), delegation_state.token_mint.as_ref()],
         bump,
-        // FIXED: This now works because DelegationState has a field named 'user_token_account'
-        has_one = user_token_account 
+        has_one = user_token_account
     )]
     pub delegation_state: Account<'info, DelegationState>,
 
@@ -154,7 +148,7 @@ pub struct CloseDelegation<'info> {
     #[account(
         mut,
         close = user,
-        seeds = [b"delegation", user.key().as_ref()],
+        seeds = [b"delegation", user.key().as_ref(), token_mint.key().as_ref()],
         bump,
         constraint = delegation_state.user == user.key()
     )]
@@ -162,6 +156,9 @@ pub struct CloseDelegation<'info> {
 
     #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
+    
+    // We need the mint to verify the PDA address
+    pub token_mint: Account<'info, Mint>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -173,14 +170,14 @@ pub struct CloseDelegation<'info> {
 #[account]
 pub struct DelegationState {
     pub user: Pubkey,
-    // FIXED: Renamed from 'token_account' to 'user_token_account' to match the Context
-    pub user_token_account: Pubkey, 
+    pub user_token_account: Pubkey,
+    pub token_mint: Pubkey, // Store the mint so we can re-derive later
     pub amount_delegated: u64,
     pub is_active: bool,
 }
 
 impl DelegationState {
-    pub const LEN: usize = 32 + 32 + 8 + 1; 
+    pub const LEN: usize = 32 + 32 + 32 + 8 + 1; 
 }
 
 #[error_code]
